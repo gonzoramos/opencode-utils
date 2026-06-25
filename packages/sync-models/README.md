@@ -23,7 +23,38 @@ uv run sync-models
 
 # Point at a different config
 uv run sync-models --config /path/to/opencode.json
+
+# Also bake num_ctx into Ollama models so they stop truncating to 2048
+uv run sync-models --set-num-ctx                      # half each model's max (default)
+uv run sync-models --set-num-ctx --ctx-fraction 0.25  # quarter of the max instead
+uv run sync-models --set-num-ctx --max-ctx 131072     # half, but never above 131072
+uv run sync-models --dry-run --set-num-ctx            # preview the num_ctx plan
 ```
+
+## Ollama context windows (`num_ctx`)
+
+Ollama defaults to a **2048-token** context at inference time regardless of a
+model's architectural max — and its OpenAI-compatible `/v1/chat/completions`
+endpoint (which OpenCode uses) **cannot** override this per request. So a model
+advertising a 256k context still silently truncates to 2048 unless `num_ctx` is
+baked into the model.
+
+Because of this:
+
+- For Ollama models, `limit.context` reflects the **effective** baked `num_ctx`
+  (read from `/api/show` `parameters`, defaulting to `2048`) — **not** the
+  architectural max. This keeps OpenCode from sending more than Ollama honours.
+- `--set-num-ctx` re-creates each Ollama model **in place** (`POST /api/create`
+  with `from == model`, inheriting weights/template/other params) with a baked
+  `num_ctx`, then updates `limit.context` to match.
+  - **Target** = `--ctx-fraction` × the model's architectural max (default
+    `0.5`, i.e. half). Architectural maxes are often 128k–500k; using the full
+    max would allocate a huge KV cache, while a small fixed window is too tight
+    for coding agents — half is a sensible middle ground.
+  - **`--max-ctx`** (optional) caps the target at an absolute value. By default
+    there is no ceiling and the fraction governs.
+  - `num_ctx` RAM cost scales roughly linearly, so lower `--ctx-fraction` (or set
+    `--max-ctx`) if a model fails to load or you're tight on memory.
 
 ## Local server details
 
