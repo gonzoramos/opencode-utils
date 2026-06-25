@@ -4,3 +4,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Local agent/project scratch notes (kept out of the public repo)
+MEMORY.md
