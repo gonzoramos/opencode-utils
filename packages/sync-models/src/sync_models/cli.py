@@ -435,12 +435,13 @@ def main():
         for mid, (cur, tgt, arch) in sorted(plan.items()):
             print(f"  Setting num_ctx {BOLD}{tgt}{RESET} on {mid} ...", end=" ", flush=True)
             ok, msg = set_num_ctx(root, mid, tgt)
-            if ok:
-                print(f"{GREEN}done{RESET}")
-                if mid in models_cfg:
-                    models_cfg[mid].setdefault("limit", {})["context"] = tgt
-            else:
-                print(f"{RED}failed — {msg}{RESET}")
+            # Align limit.context to what Ollama will actually honour: the new
+            # target on success, or the unchanged effective value on failure —
+            # never leave a stale value that overstates the real window.
+            effective = tgt if ok else cur
+            print(f"{GREEN}done{RESET}" if ok else f"{RED}failed — {msg}{RESET}")
+            if mid in models_cfg:
+                models_cfg[mid].setdefault("limit", {})["context"] = effective
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
