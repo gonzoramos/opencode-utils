@@ -1,0 +1,25 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[manifest]
+members = [
+    "opencode-utils",
+    "sync-models",
+]
+
+[[package]]
+name = "opencode-utils"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "sync-models" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "sync-models", editable = "packages/sync-models" }]
+
+[[package]]
+name = "sync-models"
+version = "0.1.0"
+source = { editable = "packages/sync-models" }

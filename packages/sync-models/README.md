@@ -1,0 +1,64 @@
+# sync-models
+
+Syncs the `provider.*.models` sections of your OpenCode config
+(`~/.config/opencode/opencode.json`) with whatever models are currently available
+on your local oMLX and Ollama servers.
+
+It reads the provider endpoints from your existing config, queries each one for its
+available models, shows a colour-coded diff (added / removed / context changed), and
+prompts before writing anything.
+
+No external dependencies — stdlib only (`urllib`, `json`, `argparse`, `pathlib`).
+
+## Usage
+
+From the monorepo root:
+
+```bash
+# Preview changes without writing
+uv run sync-models --dry-run
+
+# Apply interactively
+uv run sync-models
+
+# Point at a different config
+uv run sync-models --config /path/to/opencode.json
+```
+
+## Local server details
+
+| Provider key | URL                          | Discovery API                          |
+|--------------|------------------------------|----------------------------------------|
+| `omlx`       | `http://127.0.0.1:8067/v1`   | `GET /models` → `data[].max_model_len` |
+| `ollama`     | `http://localhost:11434/v1`  | `GET /v1/models` + `POST /api/show`    |
+
+oMLX is detected when the base URL does **not** contain port `11434` and the provider
+key is not `"ollama"`. Ollama is detected when the base URL contains `11434` or the
+provider key contains `"ollama"`.
+
+## opencode.json provider entry shape
+
+```json
+{
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "Human-readable label",
+  "options": { "baseURL": "...", "apiKey": "..." },
+  "models": {
+    "<model-id>": {
+      "name": "Friendly name",
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "attachment": false,
+      "limit": { "context": 131072, "output": 8192 }
+    }
+  }
+}
+```
+
+## Conventions
+
+- No external dependencies; keep it stdlib-only unless there's a strong reason.
+- Vision/multimodal detection for oMLX uses name heuristics (`_is_vision_by_name`);
+  for Ollama it uses the `capabilities` array from `/api/show`.
+- When a model already exists in config, only `limit.context` is updated on sync —
+  friendly names and modalities set by the user are preserved.
+- Output limits: oMLX models default to `32768`, Ollama models default to `8192`.
