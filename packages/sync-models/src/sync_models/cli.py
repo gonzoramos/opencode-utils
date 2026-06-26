@@ -3,11 +3,7 @@
 sync_models.py — Keep opencode.json in sync with local oMLX and Ollama models.
 
 Usage:
-    python sync_models.py [--config PATH] [--dry-run]
-
-Reads provider endpoints from your existing opencode.json, queries each one
-for available models, then shows a diff of what would be added, removed, or
-updated. Prompts before writing any changes.
+    sync-models [--config PATH] [--dry-run] [--set-num-ctx] [--ctx-fraction F] [--max-ctx N]
 """
 
 import argparse
@@ -17,27 +13,18 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from textual.app import App
+from textual.containers import Container
+from textual.widgets import Header, Footer, Static, RichLog, ProgressBar
+from textual import work
+
 DEFAULT_CONFIG = Path.home() / ".config/opencode/opencode.json"
 
-# Ollama's runtime context window when num_ctx is not baked into the model.
 OLLAMA_DEFAULT_NUM_CTX = 2048
-# Default fraction of a model's architectural max to bake as num_ctx. Using the
-# full max would allocate an impractically large KV cache (maxes are often
-# 256k–500k), but a small fixed ceiling is too tight for coding agents — half
-# the reported max is a sensible middle ground, tunable via --ctx-fraction.
 DEFAULT_CTX_FRACTION = 0.5
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-RESET  = "\033[0m"
-
-
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
+
 
 def fetch(url, method="GET", body=None, timeout=5):
     try:
@@ -53,8 +40,8 @@ def fetch(url, method="GET", body=None, timeout=5):
 
 # ── Model discovery ───────────────────────────────────────────────────────────
 
+
 def _pretty_name(model_id: str) -> str:
-    """Turn a model ID into a friendlier display name."""
     return model_id.replace("-", " ").replace("_", " ").replace(":", " ").title()
 
 
@@ -67,7 +54,6 @@ def _is_vision_by_name(name: str) -> bool:
 
 
 def discover_omlx(base_url: str) -> dict | None:
-    """Return {model_id: entry_dict} from an oMLX-compatible endpoint."""
     data = fetch(f"{base_url}/models")
     if data is None:
         return None
@@ -111,7 +97,6 @@ def _parse_num_ctx(parameters: str | None) -> int | None:
 
 
 def _ollama_arch_max(details: dict) -> int | None:
-    """The model's architectural max context (<arch>.context_length), or None."""
     model_info = details.get("model_info", {})
     ctx_key = next((k for k in model_info if k.endswith(".context_length")), None)
     return model_info[ctx_key] if ctx_key else None
@@ -189,7 +174,7 @@ def ollama_ctx_plan(root_url: str, fraction: float,
 
         arch_max = _ollama_arch_max(details)
         if arch_max is None:
-            continue  # can't size a target without a known max — skip
+            continue
 
         current = _parse_num_ctx(details.get("parameters")) or OLLAMA_DEFAULT_NUM_CTX
         target = _target_num_ctx(arch_max, fraction, max_ctx)
@@ -214,8 +199,6 @@ def set_num_ctx(root_url: str, model: str, num_ctx: int) -> tuple[bool, str]:
         req = urllib.request.Request(f"{root_url}/api/create", method="POST")
         req.add_header("Content-Type", "application/json")
         req.data = json.dumps(body).encode()
-        # urlopen raises HTTPError on non-2xx, so reaching here means success;
-        # the body is informational (stream:false returns a single object).
         with urllib.request.urlopen(req, timeout=300) as r:
             raw = r.read().decode(errors="replace").strip()
         try:
@@ -228,7 +211,7 @@ def set_num_ctx(root_url: str, model: str, num_ctx: int) -> tuple[bool, str]:
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:200]
         return (False, f"HTTP {e.code}: {detail}")
-    except Exception as e:  # noqa: BLE001 — surface any failure to the caller
+    except Exception as e:
         return (False, str(e))
 
 
@@ -259,6 +242,7 @@ def probe_provider(provider_key: str, options: dict) -> dict | None:
 
 # ── Diffing ───────────────────────────────────────────────────────────────────
 
+
 def diff_provider(config_models: dict, live_models: dict):
     """
     Returns:
@@ -285,25 +269,8 @@ def diff_provider(config_models: dict, live_models: dict):
     return to_add, to_remove, to_update
 
 
-def print_provider_diff(provider_key, to_add, to_remove, to_update):
-    print(f"\n  {BOLD}{CYAN}{provider_key}{RESET}")
-    for mid in sorted(to_add):
-        print(f"    {GREEN}+ {mid}{RESET}")
-    for mid in sorted(to_remove):
-        print(f"    {RED}- {mid}{RESET}")
-    for mid, changes in sorted(to_update.items()):
-        for field, (old, new) in changes.items():
-            print(f"    {YELLOW}~ {mid}  {field}: {old} → {new}{RESET}")
-
-
-def print_ctx_plan(provider_key, plan):
-    print(f"\n  {BOLD}{CYAN}{provider_key}{RESET} {DIM}(num_ctx){RESET}")
-    for mid, (cur, tgt, arch) in sorted(plan.items()):
-        print(f"    {YELLOW}~ {mid}  num_ctx: {cur} → {tgt}{RESET}"
-              f"  {DIM}(model max {arch}){RESET}")
-
-
 # ── Applying changes ──────────────────────────────────────────────────────────
+
 
 def apply(config_models: dict, live_models: dict,
           to_add, to_remove, to_update) -> dict:
@@ -322,7 +289,230 @@ def apply(config_models: dict, live_models: dict,
     return result
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Textual TUI ──────────────────────────────────────────────────────────────
+
+
+class SyncApp(App):
+    """Textual TUI for syncing opencode.json with running oMLX / Ollama models."""
+
+    TITLE = "sync-models"
+
+    CSS = """
+    #status-title {
+        margin: 0 1;
+        padding: 1 2 0 2;
+    }
+    #provider-area {
+        height: auto;
+        max-height: 12;
+        margin: 0 2;
+    }
+    #diff-area {
+        height: auto;
+        max-height: 20;
+        margin: 0 1;
+        padding: 0 1;
+    }
+    #progress-area {
+        height: auto;
+        margin: 0 2;
+    }
+    #overall-progress {
+        height: 1;
+        margin: 1 0;
+    }
+    """
+
+    def __init__(self, config: dict, config_path: Path, args):
+        super().__init__()
+        self.config = config
+        self.config_path = config_path
+        self.args = args
+        self.pending: dict = {}
+        self.ctx_pending: dict = {}
+        self._providers: list[dict] = []
+        self._model_widgets: dict[str, Static] = {}
+        self._exit_prompt: bool = False
+
+    def compose(self):
+        yield Header()
+        yield Static("[bold]Checking providers...[/bold]", id="status-title")
+        yield Container(id="provider-area")
+        yield RichLog(id="diff-area", highlight=True, markup=True)
+        yield Container(id="progress-area")
+        yield Footer()
+
+    def on_mount(self):
+        self.probe_all()
+
+    # ── Probing ──────────────────────────────────────────────────────────────
+
+    @work(thread=True, exit_on_error=False)
+    def probe_all(self):
+        providers = self.config.get("provider", {})
+
+        for pkey, pcfg in providers.items():
+            options = pcfg.get("options", {})
+            base_url = options.get("baseURL", "")
+
+            self.call_from_thread(self._add_provider_row, pkey, base_url)
+
+            live = probe_provider(pkey, options)
+            if live is None:
+                self.call_from_thread(self._set_provider_status, pkey, False,
+                                      "[red]✗[/red] unreachable")
+                continue
+
+            self.call_from_thread(self._set_provider_status, pkey, True,
+                                  f"[green]✓[/green] {len(live)} models")
+
+            config_models = pcfg.get("models", {})
+            to_add, to_remove, to_update = diff_provider(config_models, live)
+
+            if self.args.set_num_ctx and is_ollama(pkey, base_url.rstrip("/")):
+                root = ollama_root(base_url)
+                plan = ollama_ctx_plan(root, self.args.ctx_fraction, self.args.max_ctx)
+                if plan:
+                    for mid in plan:
+                        to_update.pop(mid, None)
+                    self.ctx_pending[pkey] = (plan, root)
+
+            if to_add or to_remove or to_update:
+                self.pending[pkey] = (to_add, to_remove, to_update, live)
+
+        self.call_from_thread(self._probing_done)
+
+    def _add_provider_row(self, pkey: str, base_url: str):
+        row = Static(
+            f"  [yellow]⏳[/yellow] [bold]{pkey}[/bold] "
+            f"[dim]({base_url})[/dim]  [yellow]probing...[/yellow]"
+        )
+        self.query_one("#provider-area").mount(row)
+        self._providers.append({"pkey": pkey, "widget": row, "base_url": base_url})
+
+    def _set_provider_status(self, pkey: str, ok: bool, detail: str):
+        for prov in self._providers:
+            if prov["pkey"] == pkey:
+                color = "green" if ok else "red"
+                icon = "✓" if ok else "✗"
+                prov["widget"].update(
+                    f"  [{color}]{icon}[/{color}] [bold]{pkey}[/bold] "
+                    f"[dim]({prov['base_url']})[/dim]  {detail}"
+                )
+                break
+
+    def _probing_done(self):
+        self.query_one("#status-title").update("[bold]Providers[/bold]")
+        diff = self.query_one("#diff-area")
+
+        if not self.pending and not self.ctx_pending:
+            diff.write("[green]✓ Already up to date — nothing to change.[/green]")
+            self._show_exit_prompt()
+            return
+
+        diff.write("[bold]Proposed changes:[/bold]")
+        for pkey, (to_add, to_remove, to_update, _) in self.pending.items():
+            diff.write(f"\n  [bold cyan]{pkey}[/bold cyan]")
+            for mid in sorted(to_add):
+                diff.write(f"    [green]+ {mid}[/green]")
+            for mid in sorted(to_remove):
+                diff.write(f"    [red]- {mid}[/red]")
+            for mid, changes in sorted(to_update.items()):
+                for field, (old, new) in changes.items():
+                    diff.write(
+                        f"    [yellow]~ {mid}  {field}: {old} → {new}[/yellow]"
+                    )
+        for pkey, (plan, _) in self.ctx_pending.items():
+            diff.write(f"\n  [bold cyan]{pkey}[/bold cyan] [dim](num_ctx)[/dim]")
+            for mid, (cur, tgt, arch) in sorted(plan.items()):
+                diff.write(
+                    f"    [yellow]~ {mid}  num_ctx: {cur} → {tgt}[/yellow] "
+                    f"[dim](model max {arch})[/dim]"
+                )
+
+        if self.args.dry_run:
+            diff.write("\n[dim](dry-run — config not modified)[/dim]")
+            self._show_exit_prompt()
+            return
+
+        self.do_apply()
+
+    # ── Applying ─────────────────────────────────────────────────────────────
+
+    @work(thread=True, exit_on_error=False)
+    def do_apply(self):
+        self.call_from_thread(self._setup_progress)
+
+        for pkey, (to_add, to_remove, to_update, live) in self.pending.items():
+            self.config["provider"][pkey]["models"] = apply(
+                self.config["provider"][pkey].get("models", {}),
+                live, to_add, to_remove, to_update,
+            )
+
+        total = sum(len(plan) for plan, _ in self.ctx_pending.values())
+        done = 0
+
+        for pkey, (plan, root) in self.ctx_pending.items():
+            models_cfg = self.config["provider"][pkey].setdefault("models", {})
+            for mid, (cur, tgt, arch) in sorted(plan.items()):
+                self.call_from_thread(self._set_model_status, mid,
+                                      "[yellow]⏳[/yellow] baking num_ctx...")
+                ok, msg = set_num_ctx(root, mid, tgt)
+                effective = tgt if ok else cur
+                done += 1
+                label = "[green]✓[/green] done" if ok else f"[red]✗[/red] {msg}"
+                self.call_from_thread(self._set_model_status, mid, label)
+                self.call_from_thread(self._update_progress_bar, done, total)
+                if mid in models_cfg:
+                    models_cfg[mid].setdefault("limit", {})["context"] = effective
+
+        with open(self.config_path, "w") as f:
+            json.dump(self.config, f, indent=2)
+            f.write("\n")
+
+        self.call_from_thread(self._apply_done)
+
+    def _setup_progress(self):
+        area = self.query_one("#progress-area")
+        area.mount(
+            Static("[bold]Applying changes:[/bold]", id="progress-title"),
+            ProgressBar(id="overall-progress", total=100, show_eta=False),
+        )
+        for pkey, (plan, _) in self.ctx_pending.items():
+            for mid, _ in sorted(plan.items()):
+                safe = mid.replace(":", "-").replace("/", "-")
+                w = Static(f"  [dim]{mid}[/dim]  [yellow]⏳[/yellow] pending",
+                           id=f"m-{safe}")
+                self._model_widgets[mid] = w
+                area.mount(w)
+
+    def _set_model_status(self, mid: str, status: str):
+        w = self._model_widgets.get(mid)
+        if w:
+            w.update(f"  {mid}  {status}")
+
+    def _update_progress_bar(self, done: int, total: int):
+        bar = self.query_one("#overall-progress")
+        bar.progress = int(done / total * 100) if total > 0 else 100
+
+    def _apply_done(self):
+        self.query_one("#diff-area").write("\n[green]✓ Config updated.[/green]")
+        bar = self.query_one("#overall-progress")
+        bar.progress = 100
+        bar.display = False
+        self._show_exit_prompt()
+
+    def _show_exit_prompt(self):
+        self.query_one("#diff-area").write("[dim]Press any key to exit...[/dim]")
+        self._exit_prompt = True
+
+    def on_key(self, event):
+        if self._exit_prompt:
+            self.exit()
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -356,98 +546,18 @@ def main():
 
     config_path = Path(args.config)
     if not config_path.exists():
-        print(f"{RED}Config not found: {config_path}{RESET}")
+        print(f"Config not found: {config_path}")
         sys.exit(1)
 
     with open(config_path) as f:
         config = json.load(f)
 
-    providers = config.get("provider", {})
-    if not providers:
+    if not config.get("provider"):
         print("No providers found in config.")
         sys.exit(0)
 
-    # ── Probe each provider ───────────────────────────────────────────────────
-    pending = {}      # provider_key -> (to_add, to_remove, to_update, live_models)
-    ctx_pending = {}  # provider_key -> (plan, root_url)   [--set-num-ctx, Ollama]
-
-    for pkey, pcfg in providers.items():
-        options = pcfg.get("options", {})
-        base_url = options.get("baseURL", "")
-        print(f"  Checking {BOLD}{pkey}{RESET} {DIM}({base_url}){RESET} ...", end=" ", flush=True)
-
-        live = probe_provider(pkey, options)
-        if live is None:
-            print(f"{YELLOW}unreachable — skipped{RESET}")
-            continue
-
-        print(f"{GREEN}{len(live)} model(s){RESET}")
-
-        config_models = pcfg.get("models", {})
-        to_add, to_remove, to_update = diff_provider(config_models, live)
-
-        if args.set_num_ctx and is_ollama(pkey, base_url.rstrip("/")):
-            root = ollama_root(base_url)
-            plan = ollama_ctx_plan(root, args.ctx_fraction, args.max_ctx)
-            if plan:
-                # The num_ctx pass owns the context value for these models;
-                # drop the redundant (and stale) interim context update.
-                for mid in plan:
-                    to_update.pop(mid, None)
-                ctx_pending[pkey] = (plan, root)
-
-        if to_add or to_remove or to_update:
-            pending[pkey] = (to_add, to_remove, to_update, live)
-
-    # ── Show diff ─────────────────────────────────────────────────────────────
-    if not pending and not ctx_pending:
-        print(f"\n{GREEN}✓ Already up to date — nothing to change.{RESET}")
-        return
-
-    print(f"\n{BOLD}Proposed changes:{RESET}")
-    for pkey, (to_add, to_remove, to_update, _) in pending.items():
-        print_provider_diff(pkey, to_add, to_remove, to_update)
-    for pkey, (plan, _) in ctx_pending.items():
-        print_ctx_plan(pkey, plan)
-
-    if args.dry_run:
-        print(f"\n{DIM}(dry-run — config not modified){RESET}")
-        return
-
-    # ── Confirm + write ───────────────────────────────────────────────────────
-    print()
-    answer = input(f"Apply to {config_path}? [y/N] ").strip().lower()
-    if answer != "y":
-        print("Aborted.")
-        return
-
-    # 1) Model-list changes (add / remove / context).
-    for pkey, (to_add, to_remove, to_update, live) in pending.items():
-        config["provider"][pkey]["models"] = apply(
-            config["provider"][pkey].get("models", {}),
-            live, to_add, to_remove, to_update,
-        )
-
-    # 2) num_ctx changes: re-create each model in place, then align limit.context
-    #    so OpenCode never sends more than Ollama will honour.
-    for pkey, (plan, root) in ctx_pending.items():
-        models_cfg = config["provider"][pkey].setdefault("models", {})
-        for mid, (cur, tgt, arch) in sorted(plan.items()):
-            print(f"  Setting num_ctx {BOLD}{tgt}{RESET} on {mid} ...", end=" ", flush=True)
-            ok, msg = set_num_ctx(root, mid, tgt)
-            # Align limit.context to what Ollama will actually honour: the new
-            # target on success, or the unchanged effective value on failure —
-            # never leave a stale value that overstates the real window.
-            effective = tgt if ok else cur
-            print(f"{GREEN}done{RESET}" if ok else f"{RED}failed — {msg}{RESET}")
-            if mid in models_cfg:
-                models_cfg[mid].setdefault("limit", {})["context"] = effective
-
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
-
-    print(f"{GREEN}✓ Config updated.{RESET}")
+    app = SyncApp(config, config_path, args)
+    app.run()
 
 
 if __name__ == "__main__":

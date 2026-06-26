@@ -5,10 +5,10 @@ Syncs the `provider.*.models` sections of your OpenCode config
 on your local oMLX and Ollama servers.
 
 It reads the provider endpoints from your existing config, queries each one for its
-available models, shows a colour-coded diff (added / removed / context changed), and
-prompts before writing anything.
+available models, and updates the config file — all within a **Textual TUI** that
+shows live per-provider probing status and per-model progress while baking `num_ctx`.
 
-No external dependencies — stdlib only (`urllib`, `json`, `argparse`, `pathlib`).
+No interaction required — runs are fully automatic. Press any key to exit when done.
 
 ## Usage
 
@@ -18,7 +18,7 @@ From the monorepo root:
 # Preview changes without writing
 uv run sync-models --dry-run
 
-# Apply interactively
+# Run (auto-applies any changes)
 uv run sync-models
 
 # Point at a different config
@@ -30,6 +30,21 @@ uv run sync-models --set-num-ctx --ctx-fraction 0.25  # quarter of the max inste
 uv run sync-models --set-num-ctx --max-ctx 131072     # half, but never above 131072
 uv run sync-models --dry-run --set-num-ctx            # preview the num_ctx plan
 ```
+
+## TUI feedback
+
+The Textual full-screen TUI replaces the original ANSI-escape CLI output with a
+structured live view:
+
+1. **Probing** — each provider row starts as `⏳ probing...` and updates to
+   `✓ N models` or `✗ unreachable` as results arrive.
+2. **Diff** — pending additions (`+`, green), removals (`-`, red), and context
+   changes (`~`, yellow) are printed per provider.
+3. **Apply** — if there are changes (and `--dry-run` was not passed), the tool
+   auto-advances to apply them. A progress bar shows overall completion while
+   each model being baked shows `⏳ baking num_ctx...` → `✓ done` / `✗ error`.
+4. **Exit** — once finished (or on `--dry-run`), `Press any key to exit...` is
+   shown and the TUI waits for a keypress before closing.
 
 ## Ollama context windows (`num_ctx`)
 
@@ -87,7 +102,8 @@ provider key contains `"ollama"`.
 
 ## Conventions
 
-- No external dependencies; keep it stdlib-only unless there's a strong reason.
+- The TUI uses [Textual](https://textual.textualize.io/); all widget mutations
+  are dispatched from worker threads via `call_from_thread` to stay safe.
 - Vision/multimodal detection for oMLX uses name heuristics (`_is_vision_by_name`);
   for Ollama it uses the `capabilities` array from `/api/show`.
 - When a model already exists in config, only `limit.context` is updated on sync —
