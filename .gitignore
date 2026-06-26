@@ -7,3 +7,5 @@ build/
 
 # Local agent/project scratch notes (kept out of the public repo)
 MEMORY.md
+
+.DS_Store
