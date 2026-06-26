@@ -3,6 +3,7 @@ name = "sync-models"
 version = "0.1.0"
 description = "Sync opencode.json provider models with local oMLX / Ollama servers."
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     "textual>=8.2.7",
 ]

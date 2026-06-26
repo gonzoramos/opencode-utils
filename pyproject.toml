@@ -3,6 +3,7 @@ name = "opencode-utils"
 version = "0.1.0"
 description = "Monorepo of small OpenCode utilities."
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     "sync-models",
 ]
